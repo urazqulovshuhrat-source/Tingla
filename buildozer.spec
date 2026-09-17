@@ -9,7 +9,7 @@ source.include_exts = py,png,jpg,kv,atlas
 
 version = 0.1
 
-requirements = python3==3.11.6,hostpython3==3.11.6,kivy==2.3.0,yt-dlp,certifi
+requirements = python3,kivy,yt-dlp,certifi
 
 orientation = portrait
 fullscreen = 0
