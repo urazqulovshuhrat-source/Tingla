@@ -17,7 +17,7 @@ import threading
 
 from kivy.app import App
 from kivy.clock import Clock
-from kivy.core.audio import SoundLoader
+from kivy.utils import platform
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
@@ -26,6 +26,134 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.popup import Popup
 
 import yt_dlp
+
+IS_ANDROID = platform == "android"
+
+if IS_ANDROID:
+    from jnius import autoclass, PythonJavaClass, java_method
+
+    AndroidMediaPlayer = autoclass("android.media.MediaPlayer")
+    AudioManager = autoclass("android.media.AudioManager")
+
+    class _OnPreparedListener(PythonJavaClass):
+        __javainterfaces__ = ["android/media/MediaPlayer$OnPreparedListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, callback):
+            super().__init__()
+            self.callback = callback
+
+        @java_method("(Landroid/media/MediaPlayer;)V")
+        def onPrepared(self, mp):
+            self.callback()
+
+    class _OnErrorListener(PythonJavaClass):
+        __javainterfaces__ = ["android/media/MediaPlayer$OnErrorListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, callback):
+            super().__init__()
+            self.callback = callback
+
+        @java_method("(Landroid/media/MediaPlayer;II)Z")
+        def onError(self, mp, what, extra):
+            self.callback(what, extra)
+            return True
+
+    class _OnCompletionListener(PythonJavaClass):
+        __javainterfaces__ = ["android/media/MediaPlayer$OnCompletionListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, callback):
+            super().__init__()
+            self.callback = callback
+
+        @java_method("(Landroid/media/MediaPlayer;)V")
+        def onCompletion(self, mp):
+            self.callback()
+
+
+class StreamPlayer:
+    """Android'ning tabiiy MediaPlayer'i orqali internet oqimini ijro etadi.
+
+    Kivy'ning o'z audio tizimidan farqli o'laroq, bu HTTP/HTTPS orqali
+    to'g'ridan-to'g'ri oqim (stream) qilishni to'liq qo'llab-quvvatlaydi.
+    Barcha callback'lar Android'ning o'z ichki oqimida chaqiriladi, shuning
+    uchun ular Kivy widget'larini bevosita o'zgartirmaydi - App shu
+    callback'lar ichida Clock.schedule_once orqali UI'ni yangilaydi.
+    """
+
+    def __init__(self, on_ready=None, on_error=None, on_finished=None):
+        self.on_ready = on_ready
+        self.on_error = on_error
+        self.on_finished = on_finished
+        self._mp = None
+
+    def play(self, url):
+        self.release()
+        if not IS_ANDROID:
+            if self.on_error:
+                self.on_error("Faqat Android qurilmasida ishlaydi")
+            return
+
+        self._mp = AndroidMediaPlayer()
+        try:
+            self._mp.setAudioStreamType(AudioManager.STREAM_MUSIC)
+            self._mp.setOnPreparedListener(_OnPreparedListener(self._on_prepared))
+            self._mp.setOnErrorListener(_OnErrorListener(self._on_error_cb))
+            self._mp.setOnCompletionListener(_OnCompletionListener(self._on_completion))
+            self._mp.setDataSource(url)
+            self._mp.prepareAsync()
+        except Exception as e:
+            if self.on_error:
+                self.on_error(str(e))
+
+    def _on_prepared(self):
+        try:
+            self._mp.start()
+        except Exception:
+            pass
+        if self.on_ready:
+            self.on_ready()
+
+    def _on_error_cb(self, what, extra):
+        if self.on_error:
+            self.on_error(f"MediaPlayer xatosi: {what}/{extra}")
+
+    def _on_completion(self):
+        if self.on_finished:
+            self.on_finished()
+
+    def toggle_pause(self):
+        if not self._mp:
+            return
+        try:
+            if self._mp.isPlaying():
+                self._mp.pause()
+            else:
+                self._mp.start()
+        except Exception:
+            pass
+
+    def is_playing(self):
+        if not self._mp:
+            return False
+        try:
+            return bool(self._mp.isPlaying())
+        except Exception:
+            return False
+
+    def release(self):
+        if self._mp:
+            try:
+                self._mp.stop()
+            except Exception:
+                pass
+            try:
+                self._mp.release()
+            except Exception:
+                pass
+        self._mp = None
 
 
 def yt_search(query, limit=15):
@@ -86,7 +214,11 @@ def fmt_duration(seconds):
 
 class MusicPlayerApp(App):
     def build(self):
-        self.sound = None
+        self.player = StreamPlayer(
+            on_ready=self._on_player_ready,
+            on_error=self._on_player_error,
+            on_finished=self._on_track_finished,
+        )
         self.queue = []
         self.current_index = -1
 
@@ -168,6 +300,10 @@ class MusicPlayerApp(App):
     def play_item(self, item):
         self.queue.append(item)
         self.current_index = len(self.queue) - 1
+        self._play_queue_index(self.current_index)
+
+    def _play_queue_index(self, index):
+        item = self.queue[index]
         self.show_message(f"Yuklanmoqda: {item['title']}")
         threading.Thread(
             target=self._load_and_play_thread, args=(item,), daemon=True
@@ -175,53 +311,43 @@ class MusicPlayerApp(App):
 
     def _load_and_play_thread(self, item):
         url = get_stream_url(item["id"])
-        Clock.schedule_once(lambda dt: self._play_url(url, item))
-
-    def _play_url(self, url, item):
         if not url:
-            self.show_message(f"Xato: '{item['title']}' ijro etib bo'lmadi")
+            Clock.schedule_once(
+                lambda dt: self.show_message(f"Xato: '{item['title']}' topilmadi")
+            )
             return
-        if self.sound:
-            self.sound.stop()
-            self.sound.unload()
-        self.sound = SoundLoader.load(url)
-        if self.sound:
-            self.sound.bind(on_stop=self._on_track_finished)
-            self.sound.play()
-            self.now_playing_label.text = f"▶ {item['title']}"
-        else:
-            self.show_message("Ijro etib bo'lmadi (format qo'llab-quvvatlanmaydi)")
+        self._current_title = item["title"]
+        # MediaPlayer.setDataSource/prepareAsync - alohida iplarda chaqirish xavfsiz
+        self.player.play(url)
+
+    def _on_player_ready(self, *_):
+        title = getattr(self, "_current_title", "")
+        Clock.schedule_once(lambda dt: self.show_message(f"▶ {title}"))
+
+    def _on_player_error(self, message):
+        Clock.schedule_once(lambda dt: self.show_message(f"Xato: {message}"))
 
     def _on_track_finished(self, *_):
         # Qo'shiq tugagach avtomatik keyingisiga o'tish (agar bo'lsa)
-        pass
+        Clock.schedule_once(lambda dt: self.on_next())
 
     def on_playpause(self, *_):
-        if not self.sound:
-            return
-        if self.sound.state == "play":
-            self.sound.stop()
-            self.now_playing_label.text = "⏸ To'xtatildi"
+        self.player.toggle_pause()
+        if self.player.is_playing():
+            title = getattr(self, "_current_title", "")
+            self.show_message(f"▶ {title}")
         else:
-            self.sound.play()
+            self.show_message("⏸ To'xtatildi")
 
     def on_next(self, *_):
         if self.current_index + 1 < len(self.queue):
             self.current_index += 1
-            item = self.queue[self.current_index]
-            self.show_message(f"Yuklanmoqda: {item['title']}")
-            threading.Thread(
-                target=self._load_and_play_thread, args=(item,), daemon=True
-            ).start()
+            self._play_queue_index(self.current_index)
 
     def on_prev(self, *_):
         if self.current_index > 0:
             self.current_index -= 1
-            item = self.queue[self.current_index]
-            self.show_message(f"Yuklanmoqda: {item['title']}")
-            threading.Thread(
-                target=self._load_and_play_thread, args=(item,), daemon=True
-            ).start()
+            self._play_queue_index(self.current_index)
 
     # ------------------------------------------------------------------
     def show_message(self, text):
