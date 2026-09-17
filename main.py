@@ -60,7 +60,7 @@ def get_stream_url(video_id):
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
         "skip_download": True,
     }
     url = f"https://www.youtube.com/watch?v={video_id}"
